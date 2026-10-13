@@ -183,6 +183,124 @@ function Step-Config {
     Require-Command 'openclaw' '请先运行 install，或手动安装：npm i -g openclaw@latest。'
     if (-not (Test-Path $Python)) { Fail "venv 不存在（$Venv）；请先运行 install。" }
 
+    # 提前读 .env：用于 pre-flight 修复 openclaw.json 时回填 apiKey/baseUrl。
+    # 下方还有一次 re-read——用户在交互提示里补入 key 后需要刷新 $envValues。
+    $envPath = Join-Path $Root '.env'
+    if (-not (Test-Path $envPath)) { Copy-Item (Join-Path $Root '.env.example') $envPath }
+    $envValues = Read-EnvFile $envPath
+
+    Info 'pre-flight：清理 openclaw.json 残留 null 与补齐缺失必填字段...'
+    # 部分 OpenClaw 版本执行 config unset 后会把字段留成 null 而非真正删除该键，
+    # 一旦落盘就再也无法通过 config set/doctor --fix 修复（每次校验都先失败）。
+    # 此外某些 provider 还可能整体缺 api / apiKey / baseUrl / model.name|reasoning|input 等
+    # 必填字段，导致 onboard 启动校验直接拒绝运行。
+    # 这里在写入任何配置前，原地：
+    #   1) 清空所有 null 叶子节点；
+    #   2) 按 provider id 推断 api 协议（anthropic / openai-completions）；
+    #   3) 缺失的 apiKey / baseUrl 用 .env 对应字段回填，baseUrl 缺时给协议默认 URL；
+    #   4) 每个 model 缺 name/reasoning/input 时补齐。
+    # 这一步必须在 onboard 之前跑——onboard 会校验现存配置。
+    $openclawJson = Join-Path $HOME '.openclaw-easel\openclaw.json'
+    if (Test-Path $openclawJson) {
+        # 把 .env 写到临时 JSON 文件再把路径传给 Python，避免把 JSON 走 argv 时被 PS / Windows
+        # 拆分引号或空格导致 json.loads 报 Expecting property name 之类错误。
+        $envJsonPath = Join-Path ([System.IO.Path]::GetTempPath()) "easel-heal-env-$(Get-Random).json"
+        try {
+            $envValues | ConvertTo-Json -Compress | Set-Content -Path $envJsonPath -Encoding UTF8 -NoNewline
+            @'
+import json, os, sys
+
+path = sys.argv[1]
+env = {}
+if len(sys.argv) > 2 and os.path.isfile(sys.argv[2]):
+    try:
+        with open(sys.argv[2]) as f:
+            env = json.load(f)
+    except Exception:
+        env = {}
+with open(path) as f:
+    config = json.load(f)
+
+
+def strip_nulls(node):
+    if isinstance(node, dict):
+        for key in list(node.keys()):
+            value = node[key]
+            if value is None:
+                del node[key]
+            elif isinstance(value, (dict, list)):
+                strip_nulls(value)
+    elif isinstance(node, list):
+        for item in node:
+            strip_nulls(item)
+
+
+def protocol_for(pid):
+    return "anthropic" if "anthropic" in pid.lower() else "openai-completions"
+
+
+def key_envs_for(pid):
+    if "anthropic" in pid.lower():
+        for k in ("ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN", "EASEL_LLM_API_KEY"):
+            if env.get(k):
+                return env[k]
+    else:
+        if env.get("OPENAI_API_KEY"):
+            return env["OPENAI_API_KEY"]
+    return None
+
+
+def url_for(pid):
+    if "anthropic" in pid.lower():
+        return env.get("ANTHROPIC_BASE_URL") or env.get("EASEL_LLM_BASE_URL") or "https://api.anthropic.com"
+    return env.get("OPENAI_BASE_URL") or "https://api.openai.com/v1"
+
+
+providers = config.setdefault("models", {}).setdefault("providers", {})
+
+# Pass 1：原地清空 null 叶子
+strip_nulls(providers)
+
+# Pass 2：补齐 provider / model 必填字段
+changed = False
+for pid, p in list(providers.items()):
+    if not isinstance(p, dict):
+        continue
+    if "api" not in p:
+        p["api"] = protocol_for(pid)
+        changed = True
+    if "apiKey" not in p:
+        k = key_envs_for(pid)
+        if k:
+            p["apiKey"] = k
+            changed = True
+    if "baseUrl" not in p:
+        p["baseUrl"] = url_for(pid)
+        changed = True
+    if isinstance(p.get("models"), list):
+        for m in p["models"]:
+            if not isinstance(m, dict):
+                continue
+            if "name" not in m and "id" in m:
+                m["name"] = m["id"]
+                changed = True
+            if "reasoning" not in m:
+                m["reasoning"] = False
+                changed = True
+            if "input" not in m:
+                m["input"] = ["text"]
+                changed = True
+
+if changed:
+    with open(path, "w") as f:
+        json.dump(config, f, indent=2)
+        f.write("\n")
+'@ | & $Python - $openclawJson $envJsonPath
+        } finally {
+            Remove-Item $envJsonPath -Force -ErrorAction SilentlyContinue
+        }
+    }
+
     Info '准备 Easel OpenClaw profile...'
     $onboardHelp = (& openclaw onboard --help 2>&1 | Out-String)
     $onboardArgs = @('--profile','easel','onboard','--non-interactive','--mode','local','--accept-risk')
@@ -256,50 +374,14 @@ function Step-Config {
         if ($outputsItem.LinkType -ne 'Junction') { Fail "$outputs 已存在但不是项目 outputs Junction，请移走后重试。" }
     } else { New-Item -ItemType Junction -Path $outputs -Target (Join-Path $Root 'outputs') | Out-Null }
 
-    $envPath = Join-Path $Root '.env'
-    if (-not (Test-Path $envPath)) { Copy-Item (Join-Path $Root '.env.example') $envPath }
-    $envValues = Read-EnvFile $envPath
+    # 上面已经提前读过 $envValues；这里只在「所有可用 key 都不可用」时提示用户输入。
     if (-not (Is-UsableKey $envValues['ANTHROPIC_API_KEY']) -and -not (Is-UsableKey $envValues['OPENAI_API_KEY']) -and -not (Is-UsableKey $envValues['ANTHROPIC_AUTH_TOKEN']) -and -not (Is-UsableKey $envValues['EASEL_LLM_API_KEY']) -and -not (Is-UsableKey $envValues['OPENAI_MAAS_API_KEY'])) {
         $choice = Read-Host '模型服务：1 Anthropic / 2 OpenAI-compatible / 0 稍后配置 [1]'
         if ($choice -eq '2') { $key = Read-Secret 'OpenAI API Key（不会回显）'; $url = Read-Host 'Base URL [https://api.openai.com/v1]'; $model = Read-Host '模型 [gpt-4o]'; Add-Content $envPath "`nOPENAI_API_KEY=$key`nOPENAI_BASE_URL=$url`nOPENAI_MODEL=$model" }
         elseif ($choice -eq '1' -or [string]::IsNullOrWhiteSpace($choice)) { $key = Read-Secret 'Anthropic API Key（不会回显）'; $model = Read-Host '模型 [anthropic/claude-sonnet-4-6]'; Add-Content $envPath "`nANTHROPIC_API_KEY=$key`nCLAUDE_MODEL=$model" }
     }
+    # 重新读 .env：用户在上面的交互选择里可能刚补入了 key，需刷新 $envValues。
     $envValues = Read-EnvFile $envPath
-
-    # 部分 OpenClaw 版本执行 config unset 后会把字段留成 null 而非真正删除该键，
-    # 一旦落盘就再也无法通过 config set/doctor --fix 修复（每次校验都先失败）。
-    # 这里在写入任何配置前，先把 models.providers.* 下残留的 null 叶子节点原地清空。
-    $openclawJson = Join-Path $HOME '.openclaw-easel\openclaw.json'
-    if (Test-Path $openclawJson) {
-        @'
-import json, sys
-
-path = sys.argv[1]
-with open(path) as f:
-    config = json.load(f)
-
-
-def strip_nulls(node):
-    if isinstance(node, dict):
-        changed = False
-        for key in list(node.keys()):
-            value = node[key]
-            if value is None:
-                del node[key]
-                changed = True
-            elif strip_nulls(value):
-                changed = True
-        return changed
-    return False
-
-
-providers = config.get("models", {}).get("providers", {})
-if strip_nulls(providers):
-    with open(path, "w") as f:
-        json.dump(config, f, indent=2)
-        f.write("\n")
-'@ | & $Python - $openclawJson
-    }
 
     # 仅当真正写了 anthropic provider 时，才补设它的 provider 级超时（见文末 timeoutSeconds）；
     # 否则会给 OpenAI/MAAS 用户凭空造出一个只有 timeoutSeconds、缺 baseUrl/models 的残缺 anthropic provider。
